@@ -1,5 +1,5 @@
 from enum import IntEnum
-from typing import Tuple, Union, overload
+from typing import Tuple
 
 import pyvisa
 
@@ -139,7 +139,7 @@ class nXDS:
         return ret
 
     def write(self, command: str) -> bool:
-        ret = self.instrument.query(f"!{command}")  # type: ignore
+        self.instrument.query(f"!{command}")  # type: ignore
         return True
 
     @property
@@ -153,16 +153,16 @@ class nXDS:
         return ret
 
     def start_pump(self) -> None:
-        ret = self.write("C802 1")
+        self.write("C802 1")
 
     def stop_pump(self) -> None:
-        ret = self.write("C802 0")
+        self.write("C802 0")
 
     def standby_speed(self) -> None:
-        ret = self.write("C803 0")
+        self.write("C803 0")
 
     def normal_speed(self) -> None:
-        ret = self.write("C803 1")
+        self.write("C803 1")
 
     @property
     def MotorFrequency(self) -> int:
@@ -230,7 +230,7 @@ class nXDS:
 
     def set_normal_speed_threshold(self, threshold: int) -> None:
         assert threshold >= 50 & threshold <= 100
-        ret = self.write(f"S804 {threshold}")
+        self.write(f"S804 {threshold}")
 
     @property
     def StandbySpeed(self) -> int:
@@ -241,9 +241,9 @@ class nXDS:
         assert memory in ["volatile", "non-volatile"]
         assert standby_speed >= 66 & standby_speed <= 100
         if memory == "volatile":
-            ret = self.write("C805 {standby_speed}")
+            self.write("C805 {standby_speed}")
         else:
-            ret = self.write("S805 {standby_speed}")
+            self.write("S805 {standby_speed}")
 
     @property
     def AutoRun(self) -> bool:
@@ -251,10 +251,10 @@ class nXDS:
         return bool(ret)
 
     def enable_auto_run(self) -> None:
-        ret = self.write("S806 1")
+        self.write("S806 1")
 
     def disable_auto_run(self) -> None:
-        ret = self.write("S806 0")
+        self.write("S806 0")
 
     @property
     def ServiceRegister(self) -> Tuple[ServiceRegister, ...]:
