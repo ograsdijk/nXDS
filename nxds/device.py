@@ -1,311 +1,602 @@
-from enum import IntEnum
 from typing import Tuple
 
 import pyvisa
 
-
-class SystemStatusRegister1(IntEnum):
-    DECELERATION = 0
-    ACCELERATION_RUNNING = 1
-    STANDBY_SPEED = 2
-    NORMAL_SPEED = 3
-    ABOVE_RAMP_SPEED = 4
-    ABOVE_OVERLOAD_SPEED = 5
-    SERIAL_ENABLE = 10
-
-
-class SystemStatusRegister2(IntEnum):
-    UPPER_POWER_REGULATOR_ACTIVE = 0
-    LOWER_POWER_REGULATOR_ACTIVE = 1
-    UPPER_VOLTAGE_REGULATOR_ACTIVE = 2
-    SERVICE_DUE = 4
-    WARNING = 6
-    ALARM = 7
+from .registers import (
+    ControlMode,
+    FaultRegister,
+    Service,
+    ServiceRegister,
+    SystemStatusRegister1,
+    SystemStatusRegister2,
+    WarningRegister,
+)
 
 
-class WarningRegister(IntEnum):
-    LOW_PUMP_CONTROLLER_TEMPERATURE = 1
-    PUMP_CONTROLLER_TEMPERATURE_REGULATOR_ACTIVE = (
-        6  # current restricted by high pump-controller temperature
+def serial_connection(resource_name: str):
+    """
+    Establish a serial (RS232 or RS485) connection to the nXDS pump.
+
+    Args:
+        resource_name (str): VISA resource name (e.g., 'ASRL1::INSTR').
+
+    Returns:
+        pyvisa.resources.Resource: A configured instrument resource.
+    """
+    rm = pyvisa.ResourceManager()
+    instrument = rm.open_resource(
+        resource_name=resource_name,
+        baud_rate=9600,
+        parity=pyvisa.constants.Parity.none,
+        read_termination="\r",
+        write_termination="\r",
+        data_bits=8,
+        stop_bits=1,
     )
-    HIHG_PUMP_CONTROLLER_TEMPERATURE = 10
-    SELF_TEST_WARNING = 15
+    return instrument
 
 
-class FaultRegister(IntEnum):
-    VOLTAGE_TRIP = 1  # excessive link voltage
-    CURRENT_TRIP = 2  # excessive link current
-    OVER_TEMPERATURE_TRIP = 3  # excessive pump-controller temperature
-    UNDER_TEMPERATURE_TRIP = 4  # pump-controller temperature sensor failure
-    POWER_STAGE_FAULT = 5
-    HW_FAULT_LATCH_SET = 8  # H/W fault latch active, see bits 0-7
-    EEPROM_FAULT = 9  # e.g. parameter upload incomplete
-    NO_PARAMETER_SET = 11  # parameter set upload required
-    SELF_TEST_FAULT = 12
-    SERIAL_CONTROL_MODE_INTERLOCK = 13
-    OVERLOAD_TIMEOUT = 14
-    ACCELERATION_TIMEOUT = 15  # pump frequency did not reach threshold in allowed time
+def tcpip_connection(resource_name: str):
+    """
+    Establish a TCP/IP connection (e.g., over serial-to-Ethernet bridge) to the nXDS pump.
 
+    Args:
+        resource_name (str): TCP/IP hostname or IP address.
 
-class ServiceRegister(IntEnum):
-    TIP_SEAL_SERVICE_DUE = 0
-    BEARING_SERVICE_DUE = 1
-    CONTROLLER_SERVICE_DUE = 3
-    SERVICE_DUE = 7
-
-
-class ControlMode(IntEnum):
-    NONE = 0
-    SERIAL = 1
-    PARALLEL = 2
-    MANUAL = 3
-
-
-# @overload
-# def convert_status_word_to_set_flags(
-#     word: str, register: SystemStatusRegister1
-# ) -> SystemStatusRegister1:
-#     ...
-
-
-# @overload
-# def convert_status_word_to_set_flags(
-#     word: str, register: SystemStatusRegister2
-# ) -> SystemStatusRegister2:
-#     ...
-
-
-# @overload
-# def convert_status_word_to_set_flags(
-#     word: str, register: WarningRegister
-# ) -> WarningRegister:
-#     ...
-
-
-# @overload
-# def convert_status_word_to_set_flags(
-#     word: str, register: FaultRegister
-# ) -> FaultRegister:
-#     ...
-
-
-# @overload
-# def convert_status_word_to_set_flags(
-#     word: str, register: ServiceRegister
-# ) -> ServiceRegister:
-#     ...
-
-
-# def convert_status_word_to_set_flags(
-#     word: str,
-#     register: Union[
-#         SystemStatusRegister1,
-#         SystemStatusRegister2,
-#         WarningRegister,
-#         FaultRegister,
-#         ServiceRegister,
-#     ],
-# ) -> Union[
-#     Tuple[SystemStatusRegister1, ...],
-#     Tuple[SystemStatusRegister2, ...],
-#     Tuple[WarningRegister, ...],
-#     Tuple[FaultRegister, ...],
-#     Tuple[ServiceRegister, ...],
-# ]:
-#     status = 0
-#     for idv, val in enumerate(word):
-#         status += int(val, base=16) << 4 * (3 - idv)
-#     set_flags = tuple(ssr for ssr in register if status >> ssr & 1)
-#     return set_flags
+    Returns:
+        pyvisa.resources.Resource: A configured instrument resource.
+    """
+    rm = pyvisa.ResourceManager()
+    instrument = rm.open_resource(
+        resource_name=f"TCPIP::{resource_name}::SOCKET",
+        read_terminaton="\r",  # Potentially a typo in user's code
+        write_termination="\r",
+    )
+    return instrument
 
 
 class nXDS:
-    def __init__(self, resource_name: str):
-        self.rm = pyvisa.ResourceManager()
-        self.instrument = self.rm.open_resource(
-            resource_name=resource_name,
-            baud_rate=9600,
-            parity=pyvisa.constants.Parity.none,
-            read_termination="\r",
-            write_termination="\r",
-            data_bits=8,
-            stop_bits=1,
-        )
+    """
+    High-level driver for communicating with an Edwards nXDS vacuum pump via serial or TCP/IP.
+
+    Args:
+        resource_name (str): VISA resource name or TCP/IP address.
+        connection_type (str, optional): Either "serial" or "tcpip" (case-insensitive).
+    """
+
+    def __init__(self, resource_name: str, connection_type: str = "serial"):
+        if connection_type.casefold() == "serial":
+            self.instrument = serial_connection(resource_name)
+        elif connection_type.casefold() == "tcpip":
+            self.instrument = tcpip_connection(resource_name)
+        else:
+            raise ValueError(
+                f"connection_type should be SERIAL or TCPIP; not {connection_type}"
+            )
 
     def query(self, query: str) -> str:
-        ret = self.instrument.query(f"?{query}")  # type: ignore
-        assert ret[: len(query)] == query
+        """
+        Send a query command to the pump and return the response string.
+
+        Args:
+            query (str): Command string without leading '?'.
+
+        Returns:
+            str: Raw response from the device, stripped of echoed command.
+        """
+        ret = self.instrument.query(f"?{query}")
+        assert ret[: len(query)] == query, (
+            f"Response prefix '{ret[: len(query)]}' != '{query}'"
+        )
         ret = ret.strip(query)
         return ret
 
     def write(self, command: str) -> bool:
-        self.instrument.query(f"!{command}")  # type: ignore
+        """
+        Send a write command to the pump (prefixed with '!').
+
+        Args:
+            command (str): The command to send.
+
+        Returns:
+            bool: True if the command was accepted without error.
+        """
+        self.instrument.query(f"!{command}")
         return True
 
-    @property
-    def Identification(self) -> str:
-        ret = self.query("S0")
-        return ret
-
-    @property
-    def PumpType(self) -> str:
-        ret = self.query("V801")
-        return ret
-
     def start_pump(self) -> None:
+        """
+        Start the pump.
+
+        Sends the command to start the pump via control register C802.
+        """
         self.write("C802 1")
 
     def stop_pump(self) -> None:
+        """
+        Stop the pump.
+
+        Sends the command to stop the pump via control register C802.
+        """
         self.write("C802 0")
 
-    def standby_speed(self) -> None:
-        self.write("C803 0")
+    def standby(self) -> None:
+        """
+        Set pump to standby mode.
 
-    def normal_speed(self) -> None:
+        Uses control register C803 to reduce pump speed.
+        """
         self.write("C803 1")
 
+    def normal(self) -> None:
+        """
+        Set pump to normal operating mode.
+
+        Uses control register C803 to return to full speed from standby.
+        """
+        self.write("C803 0")
+
     @property
-    def MotorFrequency(self) -> int:
+    def motor_frequency(self) -> int:
+        """
+        Read the pump motor frequency.
+
+        Returns:
+            int: Current frequency in Hz.
+        """
         ret = self.query("V802")
-        values = ret.strip(";")
+        values = ret.split(";")
         return int(values[0])
 
     @property
-    def SystemStatusRegister1(self) -> Tuple[SystemStatusRegister1, ...]:
+    def system_status_register_1(self) -> SystemStatusRegister1:
+        """
+        Read the first system status register (bits in hex).
+
+        Returns:
+            SystemStatusRegister1: Enum flags representing system status bits.
+        """
         ret = self.query("V802")
-        values = ret.strip(";")
-        status = 0
-        for idv, val in enumerate(values[1]):
-            status += int(val, base=16) << 4 * (3 - idv)
-        set_flags = tuple(ssr for ssr in SystemStatusRegister1 if status >> ssr & 1)
-        return set_flags
+        values = ret.split(";")
+        status = int(values[1], 16)
+        return SystemStatusRegister1(status)
 
     @property
-    def ControlMode(self) -> ControlMode:
+    def system_status_register_2(self) -> SystemStatusRegister2:
+        """
+        Read the second system status register.
+
+        Returns:
+            SystemStatusRegister2: Enum flags representing system status bits.
+        """
         ret = self.query("V802")
-        values = ret.strip(";")
-        status = 0
-        for idv, val in enumerate(values[0]):
-            status += int(val, base=16) << 4 * (3 - idv)
+        values = ret.split(";")
+        status = int(values[2], 16)
+        return SystemStatusRegister2(status)
+
+    @property
+    def warning_register(self) -> WarningRegister:
+        """
+        Read the warning register.
+
+        Returns:
+            WarningRegister: Enum flags representing warnings.
+        """
+        ret = self.query("V802")
+        values = ret.split(";")
+        status = int(values[3], 16)
+        return WarningRegister(status)
+
+    @property
+    def fault_register(self) -> FaultRegister:
+        """
+        Read the fault register.
+
+        Returns:
+            FaultRegister: Enum flags representing current fault status.
+        """
+        ret = self.query("V802")
+        values = ret.split(";")
+        status = int(values[4], 16)
+        return FaultRegister(status)
+
+    @property
+    def control_mode(self) -> ControlMode:
+        """
+        Decode the control mode from the bits in System Status Register 1.
+
+        Returns:
+            ControlMode: Enum indicating current control mode (none, serial, parallel, manual).
+        """
+        ret = self.query("V802")
+        values = ret.split(";")
+        status = int(values[1], 16)
         ctrl_mode = 0
-        ctrl_mode += status >> 6 & 1
-        ctrl_mode += (status >> 7 & 1) << 1
-        ctrl_mode += (status >> 13 & 1) << 2
+        ctrl_mode += (status >> 6) & 1  # bit 6
+        ctrl_mode += ((status >> 7) & 1) << 1  # bit 7
+        ctrl_mode += ((status >> 13) & 1) << 2
         return ControlMode(ctrl_mode)
 
     @property
-    def SystemStatusRegister2(self) -> Tuple[SystemStatusRegister2, ...]:
-        ret = self.query("V802")
-        values = ret.strip(";")
-        status = 0
-        for idv, val in enumerate(values[1]):
-            status += int(val, base=16) << 4 * (3 - idv)
-        set_flags = tuple(ssr for ssr in SystemStatusRegister2 if status >> ssr & 1)
-        return set_flags
+    def normal_speed_threshold(self) -> int:
+        """
+        Get the normal speed threshold percentage.
 
-    @property
-    def WarningRegister(self) -> Tuple[WarningRegister, ...]:
-        ret = self.query("V802")
-        values = ret.strip(";")
-        status = 0
-        for idv, val in enumerate(values[2]):
-            status += int(val, base=16) << 4 * (3 - idv)
-        set_flags = tuple(ssr for ssr in WarningRegister if status >> ssr & 1)
-        return set_flags
-
-    @property
-    def FaultRegister(self) -> Tuple[FaultRegister, ...]:
-        ret = self.query("V802")
-        values = ret.strip(";")
-        status = 0
-        for idv, val in enumerate(values[3]):
-            status += int(val, base=16) << 4 * (3 - idv)
-        set_flags = tuple(ssr for ssr in FaultRegister if status >> ssr & 1)
-        return set_flags
-
-    @property
-    def NormalSpeedThreshold(self) -> int:
+        Returns:
+            int: Normal speed threshold (50–100).
+        """
         ret = self.query("S804")
         return int(ret)
 
-    def set_normal_speed_threshold(self, threshold: int) -> None:
-        assert threshold >= 50 & threshold <= 100
+    @normal_speed_threshold.setter
+    def normal_speed_threshold(self, threshold: int) -> None:
+        """
+        Set the normal speed threshold.
+
+        Args:
+            threshold (int): Percentage value between 50 and 100.
+
+        Raises:
+            AssertionError: If the threshold is outside 50–100.
+        """
+        assert 50 <= threshold <= 100, "threshold must be between 50 and 100"
         self.write(f"S804 {threshold}")
 
     @property
-    def StandbySpeed(self) -> int:
+    def standby_speed(self) -> int:
+        """
+        Get the standby speed percentage.
+
+        Returns:
+            int: Standby speed (66–100).
+        """
         ret = self.query("S805")
         return int(ret)
 
     def set_standby_speed(self, standby_speed: int, memory: str = "volatile") -> None:
-        assert memory in ["volatile", "non-volatile"]
-        assert standby_speed >= 66 & standby_speed <= 100
+        """
+        Set the standby speed, optionally storing it in non-volatile memory.
+
+        Args:
+            standby_speed (int): Speed value (66–100).
+            memory (str): Either "volatile" or "non-volatile".
+
+        Raises:
+            AssertionError: If memory type is invalid or standby_speed out of bounds.
+        """
+        assert memory in ["volatile", "non-volatile"], (
+            "memory must be 'volatile' or 'non-volatile'"
+        )
+        assert 66 <= standby_speed <= 100, "standby_speed must be between 66 and 100"
         if memory == "volatile":
-            self.write("C805 {standby_speed}")
+            self.write(f"C805 {standby_speed}")
         else:
-            self.write("S805 {standby_speed}")
+            self.write(f"S805 {standby_speed}")
 
     @property
-    def AutoRun(self) -> bool:
+    def auto_run(self) -> bool:
+        """
+        Check whether auto-run on power-up is enabled.
+
+        Returns:
+            bool: True if auto-run is enabled, False otherwise.
+        """
         ret = self.query("S806")
-        return bool(ret)
+        return bool(int(ret))
 
-    def enable_auto_run(self) -> None:
-        self.write("S806 1")
+    @auto_run.setter
+    def auto_run(self, enable: bool) -> None:
+        """
+        Enable or disable auto-run on power-up.
 
-    def disable_auto_run(self) -> None:
-        self.write("S806 0")
-
-    @property
-    def ServiceRegister(self) -> Tuple[ServiceRegister, ...]:
-        values = self.query("V86")
-        status = 0
-        for idv, val in enumerate(values):
-            status += int(val, base=16) << 4 * (3 - idv)
-        set_flags = tuple(ssr for ssr in ServiceRegister if status >> ssr & 1)
-        return set_flags
+        Args:
+            enable (bool): True to enable, False to disable.
+        """
+        self.write(f"S806 {int(enable)}")
 
     @property
-    def PumpTemperature(self) -> float:
+    def temperature(self) -> Tuple[float, float]:
+        """
+        Get the pump and controller temperatures.
+
+        Returns:
+            tuple: (pump_temperature_C, controller_temperature_C)
+        """
         ret = self.query("V808")
-        values = [float(v) for v in ret.strip(";")]
-        return values[0]
+        values = [float(v) for v in ret.split(";")]
+        return (values[0], values[1])
 
     @property
-    def PumpControllerTemperature(self) -> float:
-        ret = self.query("V808")
-        values = [float(v) for v in ret.strip(";")]
-        return values[1]
+    def pump_temperature(self) -> float:
+        """
+        Returns the pump body temperature.
+
+        Returns:
+            float: Pump temperature in °C.
+        """
+        return self.temperature[0]
 
     @property
-    def LinkVoltage(self) -> float:
+    def pump_controller_temperature(self) -> float:
+        """
+        Returns the controller board temperature.
+
+        Returns:
+            float: Controller temperature in °C.
+        """
+        return self.temperature[1]
+
+    @property
+    def link_parameters(self) -> Tuple[float, float, float]:
+        """
+        Get link voltage, motor current, and power.
+
+        Returns:
+            Tuple[float, float, float]: (voltage [V], current [A], power [W])
+        """
         ret = self.query("V809")
-        values = [float(v) * 0.1 for v in ret.strip(";")]
-        return values[0]
+        values = [float(v) * 0.1 for v in ret.split(";")]
+        return (values[0], values[1], values[2])
 
     @property
-    def MotorCurrent(self) -> float:
-        ret = self.query("V809")
-        values = [float(v) * 0.1 for v in ret.strip(";")]
-        return values[1]
+    def link_voltage(self) -> float:
+        """
+        Link voltage reported by the drive.
+
+        Returns:
+            float: Voltage in volts.
+        """
+        return self.link_parameters[0]
 
     @property
-    def MotorPower(self) -> float:
-        ret = self.query("V809")
-        values = [float(v) * 0.1 for v in ret.strip(";")]
-        return values[2]
+    def motor_current(self) -> float:
+        """
+        Motor current drawn by the pump.
+
+        Returns:
+            float: Current in amps.
+        """
+        return self.link_parameters[1]
 
     @property
-    def RunHours(self) -> float:
+    def motor_power(self) -> float:
+        """
+        Motor power usage.
+
+        Returns:
+            float: Power in watts.
+        """
+        return self.link_parameters[2]
+
+    @property
+    def run_hours(self) -> float:
+        """
+        Total number of hours the pump has run.
+
+        Returns:
+            float: Run time in hours.
+        """
         ret = self.query("V810")
         return float(ret)
 
     @property
-    def PumpCycles(self) -> int:
+    def pump_cycles(self) -> int:
+        """
+        Total number of pump start/stop cycles.
+
+        Returns:
+            int: Number of cycles.
+        """
         ret = self.query("V811")
         return int(ret)
 
     @property
-    def DriveRuntime(self) -> int:
+    def drive_runtime(self) -> Tuple[float, float]:
+        """
+        Drive runtime information.
+
+        Returns:
+            Tuple[float, float]: (total hours run, hours until replacement)
+        """
         ret = self.query("V813")
-        return int(ret)
+        vals = ret.split(";")
+        return (float(vals[0]), float(vals[1]))
+
+    @property
+    def time_since_tipseal_service(self) -> Tuple[float, float]:
+        """
+        Time since tipseal service.
+
+        Returns:
+            Tuple[float, float]: (hours since service, hours until due)
+        """
+        ret = self.query("V814")
+        vals = ret.split(";")
+        return (float(vals[0]), float(vals[1]))
+
+    def reset_tipseal_service_timer(self) -> None:
+        """
+        Reset the tipseal service timer (`!C814 1`).
+        """
+        self.write("C814 1")
+
+    @property
+    def time_since_bearing_service(self) -> Tuple[float, float]:
+        """
+        Time since bearing service.
+
+        Returns:
+            Tuple[float, float]: (hours since service, hours until due)
+        """
+        ret = self.query("V815")
+        vals = ret.split(";")
+        return (float(vals[0]), float(vals[1]))
+
+    def reset_bearing_service_timer(self) -> None:
+        """
+        Reset the bearing service timer (`!C815 1`).
+        """
+        self.write("C815 1")
+
+    def get_fault_history(
+        self, fault_history: int
+    ) -> tuple[
+        float,
+        SystemStatusRegister1,
+        SystemStatusRegister2,
+        WarningRegister,
+        FaultRegister,
+    ]:
+        """
+        Read fault history entry (1–4).
+
+        Args:
+            fault_history (int): History index from 1 to 4.
+
+        Returns:
+            tuple: (pump power on time [h], SystemStatusRegister1, SystemStatusRegister2, WarningRegister, FaultRegister)
+        """
+        ret = self.query(f"V81{fault_history + 5}")
+        values = ret.split(";")
+        # time pump-controller has run, then 4 hex words
+        # convert time to float, convert each hex word to the respective IntFlag
+        float_time = float(values[0])
+        ssr1 = SystemStatusRegister1(int(values[1], 16))
+        ssr2 = SystemStatusRegister2(int(values[2], 16))
+        warn = WarningRegister(int(values[3], 16))
+        fault = FaultRegister(int(values[4], 16))
+        return (float_time, ssr1, ssr2, warn, fault)
+
+    @property
+    def fault_history_1(
+        self,
+    ) -> tuple[
+        float,
+        SystemStatusRegister1,
+        SystemStatusRegister2,
+        WarningRegister,
+        FaultRegister,
+    ]:
+        """
+        Retrieve the most recent fault history entry.
+
+        Returns:
+            tuple: (pump power on time [h], SSR1, SSR2, warning, fault)
+        """
+        return self.get_fault_history(1)
+
+    @property
+    def fault_history_2(
+        self,
+    ) -> tuple[
+        float,
+        SystemStatusRegister1,
+        SystemStatusRegister2,
+        WarningRegister,
+        FaultRegister,
+    ]:
+        """
+        Retrieve the second fault history entry.
+
+        Returns:
+            tuple: (pump power on time [h], SSR1, SSR2, warning, fault)
+        """
+        return self.get_fault_history(2)
+
+    @property
+    def fault_history_3(
+        self,
+    ) -> tuple[
+        float,
+        SystemStatusRegister1,
+        SystemStatusRegister2,
+        WarningRegister,
+        FaultRegister,
+    ]:
+        """
+        Retrieve the third fault history entry.
+
+        Returns:
+            tuple: (pump power on time [h], SSR1, SSR2, warning, fault)
+        """
+        return self.get_fault_history(3)
+
+    @property
+    def fault_history_4(
+        self,
+    ) -> tuple[
+        float,
+        SystemStatusRegister1,
+        SystemStatusRegister2,
+        WarningRegister,
+        FaultRegister,
+    ]:
+        """
+        Retrieve the fourth fault history entry.
+
+        Returns:
+            tuple: (pump power on time [h], SSR1, SSR2, warning, fault)
+        """
+        return self.get_fault_history(4)
+
+    @property
+    def customer_interface_software_version(self) -> str:
+        """
+        Get the software version string for the customer interface.
+
+        Returns:
+            str: Version string.
+        """
+        return self.query("S820")
+
+    @property
+    def motor_control_boot_loader_version(self) -> str:
+        """
+        Get the motor control bootloader firmware version.
+
+        Returns:
+            str: Version string.
+        """
+        return self.query("S822")
+
+    @property
+    def customer_interface_boot_loader_version(self) -> str:
+        """
+        Get the customer interface bootloader firmware version.
+
+        Returns:
+            str: Version string.
+        """
+        return self.query("S823")
+
+    @property
+    def service_settings(self) -> Service:
+        """
+        Get current service settings configuration.
+
+        Returns:
+            Service: Enum value for current service display/FAIL output mode.
+        """
+        return Service(int(self.query("S825")))
+
+    @property
+    def service_register(self) -> ServiceRegister:
+        """
+        Read the service register (status flags indicating due maintenance).
+
+        Returns:
+            ServiceRegister: Bitmask with service-related flags.
+        """
+        values = self.query("V826")
+        status = int(values, 16)
+        return ServiceRegister(status)
+
+    @property
+    def service(self) -> str:
+        """
+        Return serial numbers and build info (pump, drive module, control PCB).
+
+        Returns:
+            str: string encoding pump identity.
+        """
+        return self.query("S835")
