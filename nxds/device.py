@@ -137,6 +137,36 @@ class nXDS:
         self.write("C803 0")
 
     @property
+    def pump_control(
+        self,
+    ) -> tuple[
+        float,
+        SystemStatusRegister1,
+        SystemStatusRegister2,
+        WarningRegister,
+        FaultRegister,
+    ]:
+        """
+        Query the pump for motor frequency and status registers (?V802).
+
+        Returns:
+            tuple:
+                - float: Motor frequency in Hz
+                - SystemStatusRegister1: Enum flags for System Status Register 1
+                - SystemStatusRegister2: Enum flags for System Status Register 2
+                - WarningRegister: Enum flags for warnings
+                - FaultRegister: Enum flags for faults
+        """
+        resp = self.query("V802")
+        parts = resp.split(";")
+        motor_freq = float(parts[0])
+        ssr1 = SystemStatusRegister1(int(parts[1], 16))
+        ssr2 = SystemStatusRegister2(int(parts[2], 16))
+        warn = WarningRegister(int(parts[3], 16))
+        fault = FaultRegister(int(parts[4], 16))
+        return (motor_freq, ssr1, ssr2, warn, fault)
+
+    @property
     def motor_frequency(self) -> int:
         """
         Read the pump motor frequency.
@@ -144,9 +174,7 @@ class nXDS:
         Returns:
             int: Current frequency in Hz.
         """
-        ret = self.query("V802")
-        values = ret.split(";")
-        return int(values[0])
+        self.pump_control[0]
 
     @property
     def system_status_register_1(self) -> SystemStatusRegister1:
@@ -156,10 +184,7 @@ class nXDS:
         Returns:
             SystemStatusRegister1: Enum flags representing system status bits.
         """
-        ret = self.query("V802")
-        values = ret.split(";")
-        status = int(values[1], 16)
-        return SystemStatusRegister1(status)
+        self.pump_control[1]
 
     @property
     def system_status_register_2(self) -> SystemStatusRegister2:
@@ -169,10 +194,7 @@ class nXDS:
         Returns:
             SystemStatusRegister2: Enum flags representing system status bits.
         """
-        ret = self.query("V802")
-        values = ret.split(";")
-        status = int(values[2], 16)
-        return SystemStatusRegister2(status)
+        self.pump_control[2]
 
     @property
     def warning_register(self) -> WarningRegister:
@@ -182,10 +204,7 @@ class nXDS:
         Returns:
             WarningRegister: Enum flags representing warnings.
         """
-        ret = self.query("V802")
-        values = ret.split(";")
-        status = int(values[3], 16)
-        return WarningRegister(status)
+        self.pump_control[3]
 
     @property
     def fault_register(self) -> FaultRegister:
@@ -195,10 +214,7 @@ class nXDS:
         Returns:
             FaultRegister: Enum flags representing current fault status.
         """
-        ret = self.query("V802")
-        values = ret.split(";")
-        status = int(values[4], 16)
-        return FaultRegister(status)
+        self.pump_control[4]
 
     @property
     def control_mode(self) -> ControlMode:
