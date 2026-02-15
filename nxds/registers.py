@@ -1,7 +1,19 @@
 from enum import IntEnum, IntFlag
 
+__all__ = [
+    "SystemStatusRegister1",
+    "SystemStatusRegister2",
+    "WarningRegister",
+    "FaultRegister",
+    "ServiceRegister",
+    "ControlMode",
+    "Service",
+]
+
 
 class SystemStatusRegister1(IntFlag):
+    """Bit flags from system status register 1."""
+
     DECELERATION = 1 << 0
     ACCELERATION_RUNNING = 1 << 1
     STANDBY_SPEED = 1 << 2
@@ -12,6 +24,8 @@ class SystemStatusRegister1(IntFlag):
 
 
 class SystemStatusRegister2(IntFlag):
+    """Bit flags from system status register 2."""
+
     UPPER_POWER_REGULATOR_ACTIVE = 1 << 0
     LOWER_POWER_REGULATOR_ACTIVE = 1 << 1
     UPPER_VOLTAGE_REGULATOR_ACTIVE = 1 << 2
@@ -21,6 +35,8 @@ class SystemStatusRegister2(IntFlag):
 
 
 class WarningRegister(IntFlag):
+    """Bit flags from warning register."""
+
     LOW_PUMP_CONTROLLER_TEMPERATURE = 1 << 1
     PUMP_CONTROLLER_TEMPERATURE_REGULATOR_ACTIVE = (
         1 << 6  # current restricted by high pump-controller temperature
@@ -30,6 +46,8 @@ class WarningRegister(IntFlag):
 
 
 class FaultRegister(IntFlag):
+    """Bit flags from fault register."""
+
     VOLTAGE_TRIP = 1 << 1  # excessive link voltage
     CURRENT_TRIP = 1 << 2  # excessive link current
     OVER_TEMPERATURE_TRIP = 1 << 3  # excessive pump-controller temperature
@@ -47,6 +65,8 @@ class FaultRegister(IntFlag):
 
 
 class ServiceRegister(IntFlag):
+    """Bit flags indicating due maintenance/service state."""
+
     TIP_SEAL_SERVICE_DUE = 1 << 0
     BEARING_SERVICE_DUE = 1 << 1
     CONTROLLER_SERVICE_DUE = 1 << 3
@@ -54,13 +74,17 @@ class ServiceRegister(IntFlag):
 
 
 class ControlMode(IntEnum):
+    """Pump control source/mode."""
+
     NONE = 0
     SERIAL = 1
     PARALLEL = 2
     MANUAL = 3
 
 
-class Service(IntFlag):
+class Service(IntEnum):
+    """Service output/display mode value from register S825 (single choice)."""
+
     SERVICE_LED = 0
     SERVICE_LED_LINE = 1
     NONE = 2

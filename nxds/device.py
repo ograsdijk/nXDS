@@ -1,6 +1,9 @@
-from typing import Tuple
+import socket
+import time
+from dataclasses import dataclass
+from typing import Literal, Tuple
 
-import pyvisa
+import serial
 
 from .registers import (
     ControlMode,
@@ -13,66 +16,442 @@ from .registers import (
 )
 
 
-def serial_connection(resource_name: str):
-    """
-    Establish a serial (RS232 or RS485) connection to the nXDS pump.
-
-    Args:
-        resource_name (str): VISA resource name (e.g., 'ASRL1::INSTR').
-
-    Returns:
-        pyvisa.resources.Resource: A configured instrument resource.
-    """
-    rm = pyvisa.ResourceManager()
-    instrument = rm.open_resource(
-        resource_name=resource_name,
-        baud_rate=9600,
-        parity=pyvisa.constants.Parity.none,
-        read_termination="\r",
-        write_termination="\r",
-        data_bits=8,
-        stop_bits=1,
-    )
-    return instrument
+class nXDSError(Exception):
+    """Base exception for nXDS communication and protocol errors."""
 
 
-def tcpip_connection(resource_name: str):
-    """
-    Establish a TCP/IP connection (e.g., over serial-to-Ethernet bridge) to the nXDS pump.
+class nXDSTimeoutError(nXDSError):
+    """Raised when a command does not receive a response in time."""
 
-    Args:
-        resource_name (str): TCP/IP hostname or IP address.
 
-    Returns:
-        pyvisa.resources.Resource: A configured instrument resource.
-    """
-    rm = pyvisa.ResourceManager()
-    instrument = rm.open_resource(
-        resource_name=f"TCPIP::{resource_name}::SOCKET",
-        read_terminaton="\r",  # Potentially a typo in user's code
-        write_termination="\r",
-    )
-    return instrument
+class nXDSProtocolError(nXDSError):
+    """Raised when a response violates expected protocol framing/content."""
+
+
+class nXDSParseError(nXDSError):
+    """Raised when a response cannot be parsed into expected values."""
+
+
+class nXDSUnsupportedTransportOperationError(nXDSError):
+    """Raised when a transport does not support a requested operation."""
+
+
+@dataclass(frozen=True)
+class PumpControlStatus:
+    motor_frequency_hz: float
+    system_status_register_1: SystemStatusRegister1
+    system_status_register_2: SystemStatusRegister2
+    warning_register: WarningRegister
+    fault_register: FaultRegister
+
+
+class _Command:
+    START_PUMP = "C802 1"
+    STOP_PUMP = "C802 0"
+    STANDBY_ON = "C803 1"
+    STANDBY_OFF = "C803 0"
+    PUMP_CONTROL = "V802"
+    NORMAL_SPEED_THRESHOLD = "S804"
+    STANDBY_SPEED = "S805"
+    STANDBY_SPEED_VOLATILE_PREFIX = "C805"
+    AUTO_RUN = "S806"
+    TEMPERATURE = "V808"
+    LINK_PARAMETERS = "V809"
+    RUN_HOURS = "V810"
+    PUMP_CYCLES = "V811"
+    DRIVE_RUNTIME = "V813"
+    TIPSEAL_SERVICE = "V814"
+    TIPSEAL_SERVICE_RESET = "C814 1"
+    BEARING_SERVICE = "V815"
+    BEARING_SERVICE_RESET = "C815 1"
+    CUSTOMER_INTERFACE_SW = "S820"
+    MOTOR_CONTROL_BOOT = "S822"
+    CUSTOMER_INTERFACE_BOOT = "S823"
+    SERVICE_SETTINGS = "S825"
+    SERVICE_REGISTER = "V826"
+    SERVICE_INFO = "S835"
+
+
+# =============================================================================
+# Transport base
+# =============================================================================
+class BaseTransport:
+    """Minimal transport interface used by nXDS."""
+
+    supports_serial_reconfigure: bool = False
+
+    def open(self) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    @property
+    def is_open(self) -> bool:
+        raise NotImplementedError
+
+    def write(self, data: bytes) -> None:
+        raise NotImplementedError
+
+    def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
+        raise NotImplementedError
+
+    def flush_input(self) -> None:
+        raise NotImplementedError
+
+    def flush_output(self) -> None:
+        raise NotImplementedError
+
+    def set_baudrate(self, baudrate: int) -> None:
+        raise nXDSUnsupportedTransportOperationError(
+            "Transport does not support runtime baudrate changes."
+        )
+
+    def set_parity(self, parity: Literal["N", "O", "E"]) -> None:
+        raise nXDSUnsupportedTransportOperationError(
+            "Transport does not support runtime parity changes."
+        )
+
+
+class SerialTransport(BaseTransport):
+    """Local serial transport (pyserial)."""
+
+    supports_serial_reconfigure = True
+
+    def __init__(
+        self,
+        port: str,
+        *,
+        baudrate: int = 19200,
+        timeout_s: float = 0.25,
+        bytesize: int = serial.EIGHTBITS,
+        parity: str = serial.PARITY_NONE,
+        stopbits: int = serial.STOPBITS_ONE,
+    ) -> None:
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout_s = timeout_s
+        self.bytesize = bytesize
+        self.parity = parity
+        self.stopbits = stopbits
+        self._ser: serial.Serial | None = None
+
+    def open(self) -> None:
+        if self._ser is not None and self._ser.is_open:
+            return
+        self._ser = serial.Serial(
+            port=self.port,
+            baudrate=self.baudrate,
+            timeout=self.timeout_s,
+            write_timeout=self.timeout_s,
+            bytesize=self.bytesize,
+            parity=self.parity,
+            stopbits=self.stopbits,
+        )
+        self.flush_input()
+        self.flush_output()
+
+    def close(self) -> None:
+        if self._ser is not None and self._ser.is_open:
+            self._ser.close()
+
+    @property
+    def is_open(self) -> bool:
+        return bool(self._ser is not None and self._ser.is_open)
+
+    def _require_open(self) -> serial.Serial:
+        if self._ser is None or not self._ser.is_open:
+            raise nXDSError("SerialTransport is not open.")
+        return self._ser
+
+    def write(self, data: bytes) -> None:
+        ser = self._require_open()
+        ser.write(data)
+        ser.flush()
+
+    def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
+        ser = self._require_open()
+        old_timeout = ser.timeout
+        try:
+            if timeout_s is not None:
+                ser.timeout = timeout_s
+            return ser.read_until(terminator)
+        finally:
+            ser.timeout = old_timeout
+
+    def flush_input(self) -> None:
+        self._require_open().reset_input_buffer()
+
+    def flush_output(self) -> None:
+        self._require_open().reset_output_buffer()
+
+    def set_baudrate(self, baudrate: int) -> None:
+        ser = self._require_open()
+        ser.baudrate = baudrate
+        self.baudrate = baudrate
+
+    def set_parity(self, parity: Literal["N", "O", "E"]) -> None:
+        ser = self._require_open()
+        if parity == "N":
+            ser.parity = serial.PARITY_NONE
+            self.parity = serial.PARITY_NONE
+        elif parity == "O":
+            ser.parity = serial.PARITY_ODD
+            self.parity = serial.PARITY_ODD
+        elif parity == "E":
+            ser.parity = serial.PARITY_EVEN
+            self.parity = serial.PARITY_EVEN
+        else:
+            raise ValueError("parity must be one of 'N', 'O', 'E'")
+
+
+class TcpSocketTransport(BaseTransport):
+    """TCP socket transport."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout_s: float = 0.25,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.timeout_s = timeout_s
+        self._sock: socket.socket | None = None
+
+    def open(self) -> None:
+        if self._sock is not None:
+            return
+        self._sock = socket.create_connection(
+            (self.host, self.port),
+            timeout=self.timeout_s,
+        )
+        self._sock.settimeout(self.timeout_s)
+
+    def close(self) -> None:
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+
+    @property
+    def is_open(self) -> bool:
+        return self._sock is not None
+
+    def _require_open(self) -> socket.socket:
+        if self._sock is None:
+            raise nXDSError("TcpSocketTransport is not open.")
+        return self._sock
+
+    def write(self, data: bytes) -> None:
+        self._require_open().sendall(data)
+
+    def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
+        sock = self._require_open()
+        old_timeout = sock.gettimeout()
+        if timeout_s is not None:
+            sock.settimeout(timeout_s)
+        try:
+            buf = bytearray()
+            while not buf.endswith(terminator):
+                chunk = sock.recv(1)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+            return bytes(buf)
+        finally:
+            sock.settimeout(old_timeout)
+
+    def flush_input(self) -> None:
+        # No generic portable TCP input flush.
+        return None
+
+    def flush_output(self) -> None:
+        # No generic portable TCP output flush.
+        return None
 
 
 class nXDS:
     """
-    High-level driver for communicating with an Edwards nXDS vacuum pump via serial or TCP/IP.
+    High-level driver for communicating with an Edwards nXDS vacuum pump.
 
     Args:
-        resource_name (str): VISA resource name or TCP/IP address.
-        connection_type (str, optional): Either "serial" or "tcpip" (case-insensitive).
+        transport (BaseTransport): Transport implementation used for communication.
     """
 
-    def __init__(self, resource_name: str, connection_type: str = "serial"):
-        if connection_type.casefold() == "serial":
-            self.instrument = serial_connection(resource_name)
-        elif connection_type.casefold() == "tcpip":
-            self.instrument = tcpip_connection(resource_name)
-        else:
-            raise ValueError(
-                f"connection_type should be SERIAL or TCPIP; not {connection_type}"
+    def __init__(
+        self,
+        transport: BaseTransport,
+        *,
+        retries: int = 0,
+        response_timeout_s: float | None = None,
+    ):
+        if retries < 0:
+            raise ValueError("retries must be >= 0")
+
+        self.transport = transport
+
+        self.transport.open()
+        self._terminator = b"\r"
+        self._retries = retries
+        self._response_timeout_s = response_timeout_s
+
+    @classmethod
+    def from_serial_port(
+        cls,
+        port: str,
+        *,
+        baudrate: int = 19200,
+        timeout_s: float = 0.25,
+        bytesize: int = serial.EIGHTBITS,
+        parity: str = serial.PARITY_NONE,
+        stopbits: int = serial.STOPBITS_ONE,
+        retries: int = 0,
+        response_timeout_s: float | None = None,
+    ):
+        """Create a device instance backed by `SerialTransport`."""
+        transport = SerialTransport(
+            port,
+            baudrate=baudrate,
+            timeout_s=timeout_s,
+            bytesize=bytesize,
+            parity=parity,
+            stopbits=stopbits,
+        )
+        return cls(
+            transport,
+            retries=retries,
+            response_timeout_s=response_timeout_s,
+        )
+
+    @classmethod
+    def from_tcp(
+        cls,
+        host: str,
+        port: int,
+        *,
+        timeout_s: float = 0.25,
+        retries: int = 0,
+        response_timeout_s: float | None = None,
+    ):
+        """Create a device instance backed by `TcpSocketTransport`."""
+        transport = TcpSocketTransport(
+            host,
+            port,
+            timeout_s=timeout_s,
+        )
+        return cls(
+            transport,
+            retries=retries,
+            response_timeout_s=response_timeout_s,
+        )
+
+    def __enter__(self):
+        """Context manager entry; returns this device instance."""
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        """Context manager exit; always closes transport."""
+        self.close()
+        return False
+
+    def close(self) -> None:
+        """Close the underlying transport."""
+        self.transport.close()
+
+    @property
+    def is_open(self) -> bool:
+        """Return whether the underlying transport is currently open."""
+        return self.transport.is_open
+
+    def _split_fields(self, response: str, expected: int, command: str) -> list[str]:
+        parts = response.split(";")
+        if len(parts) != expected:
+            raise nXDSProtocolError(
+                f"Invalid response for '{command}': expected {expected} fields, got {len(parts)}; response='{response}'"
             )
+        return parts
+
+    def _read_scalar(self, register: str) -> str:
+        return self.query(register)
+
+    def _read_fields(self, register: str, expected: int) -> list[str]:
+        return self._split_fields(self.query(register), expected, register)
+
+    def _read_int(self, register: str) -> int:
+        try:
+            return int(self._read_scalar(register))
+        except ValueError as exc:
+            raise nXDSParseError(f"Invalid int response for '{register}'") from exc
+
+    def _read_float(self, register: str) -> float:
+        try:
+            return float(self._read_scalar(register))
+        except ValueError as exc:
+            raise nXDSParseError(f"Invalid float response for '{register}'") from exc
+
+    def _write_register(self, register: str, value: int) -> bool:
+        return self.write(f"{register} {value}")
+
+    def _parse_status_frame(self, response: str, command: str) -> PumpControlStatus:
+        parts = self._split_fields(response, 5, command)
+        try:
+            motor_freq = float(parts[0])
+            ssr1 = SystemStatusRegister1(int(parts[1], 16))
+            ssr2 = SystemStatusRegister2(int(parts[2], 16))
+            warn = WarningRegister(int(parts[3], 16))
+            fault = FaultRegister(int(parts[4], 16))
+        except ValueError as exc:
+            raise nXDSParseError(
+                f"Invalid numeric field in response for '{command}': '{response}'"
+            ) from exc
+        return PumpControlStatus(
+            motor_frequency_hz=motor_freq,
+            system_status_register_1=ssr1,
+            system_status_register_2=ssr2,
+            warning_register=warn,
+            fault_register=fault,
+        )
+
+    def _exchange(
+        self,
+        payload: str,
+        *,
+        timeout_s: float | None = None,
+        expect_prefix: str | None = None,
+    ) -> str:
+        attempts = self._retries + 1
+        last_response = ""
+        for attempt in range(attempts):
+            self.transport.write(payload.encode("ascii") + self._terminator)
+            response = self.transport.read_until(
+                self._terminator,
+                timeout_s=(
+                    self._response_timeout_s if timeout_s is None else timeout_s
+                ),
+            )
+            decoded = response.decode("ascii", errors="replace").strip()
+            last_response = decoded
+
+            if not decoded:
+                if attempt < attempts - 1:
+                    time.sleep(0.01)
+                    continue
+                raise nXDSTimeoutError(f"Empty response for '{payload}'")
+
+            if expect_prefix is not None and not decoded.startswith(expect_prefix):
+                if attempt < attempts - 1:
+                    time.sleep(0.01)
+                    continue
+                raise nXDSProtocolError(
+                    f"Response prefix '{decoded[: len(expect_prefix)]}' != '{expect_prefix}'"
+                )
+
+            return decoded
+
+        raise nXDSTimeoutError(
+            f"No valid response for '{payload}' after {attempts} attempts; last response='{last_response}'"
+        )
 
     def query(self, query: str) -> str:
         """
@@ -84,12 +463,8 @@ class nXDS:
         Returns:
             str: Raw response from the device, stripped of echoed command.
         """
-        ret = self.instrument.query(f"?{query}")
-        assert ret[: len(query)] == query, (
-            f"Response prefix '{ret[: len(query)]}' != '{query}'"
-        )
-        ret = ret.strip(query)
-        return ret
+        ret = self._exchange(f"?{query}", expect_prefix=query)
+        return ret[len(query) :].lstrip(" ;")
 
     def write(self, command: str) -> bool:
         """
@@ -101,7 +476,7 @@ class nXDS:
         Returns:
             bool: True if the command was accepted without error.
         """
-        self.instrument.query(f"!{command}")
+        self._exchange(f"!{command}", expect_prefix=command)
         return True
 
     def start_pump(self) -> None:
@@ -110,7 +485,7 @@ class nXDS:
 
         Sends the command to start the pump via control register C802.
         """
-        self.write("C802 1")
+        self.write(_Command.START_PUMP)
 
     def stop_pump(self) -> None:
         """
@@ -118,7 +493,7 @@ class nXDS:
 
         Sends the command to stop the pump via control register C802.
         """
-        self.write("C802 0")
+        self.write(_Command.STOP_PUMP)
 
     def standby(self) -> None:
         """
@@ -126,7 +501,7 @@ class nXDS:
 
         Uses control register C803 to reduce pump speed.
         """
-        self.write("C803 1")
+        self.write(_Command.STANDBY_ON)
 
     def normal(self) -> None:
         """
@@ -134,7 +509,7 @@ class nXDS:
 
         Uses control register C803 to return to full speed from standby.
         """
-        self.write("C803 0")
+        self.write(_Command.STANDBY_OFF)
 
     @property
     def pump_control(
@@ -157,14 +532,23 @@ class nXDS:
                 - WarningRegister: Enum flags for warnings
                 - FaultRegister: Enum flags for faults
         """
-        resp = self.query("V802")
-        parts = resp.split(";")
-        motor_freq = float(parts[0])
-        ssr1 = SystemStatusRegister1(int(parts[1], 16))
-        ssr2 = SystemStatusRegister2(int(parts[2], 16))
-        warn = WarningRegister(int(parts[3], 16))
-        fault = FaultRegister(int(parts[4], 16))
-        return (motor_freq, ssr1, ssr2, warn, fault)
+        status = self._parse_status_frame(
+            self._read_scalar(_Command.PUMP_CONTROL), _Command.PUMP_CONTROL
+        )
+        return (
+            status.motor_frequency_hz,
+            status.system_status_register_1,
+            status.system_status_register_2,
+            status.warning_register,
+            status.fault_register,
+        )
+
+    @property
+    def pump_control_status(self) -> PumpControlStatus:
+        """Typed snapshot of pump control frame V802."""
+        return self._parse_status_frame(
+            self._read_scalar(_Command.PUMP_CONTROL), _Command.PUMP_CONTROL
+        )
 
     @property
     def motor_frequency(self) -> int:
@@ -174,7 +558,7 @@ class nXDS:
         Returns:
             int: Current frequency in Hz.
         """
-        self.pump_control[0]
+        return int(self.pump_control_status.motor_frequency_hz)
 
     @property
     def system_status_register_1(self) -> SystemStatusRegister1:
@@ -184,7 +568,7 @@ class nXDS:
         Returns:
             SystemStatusRegister1: Enum flags representing system status bits.
         """
-        self.pump_control[1]
+        return self.pump_control_status.system_status_register_1
 
     @property
     def system_status_register_2(self) -> SystemStatusRegister2:
@@ -194,7 +578,7 @@ class nXDS:
         Returns:
             SystemStatusRegister2: Enum flags representing system status bits.
         """
-        self.pump_control[2]
+        return self.pump_control_status.system_status_register_2
 
     @property
     def warning_register(self) -> WarningRegister:
@@ -204,7 +588,7 @@ class nXDS:
         Returns:
             WarningRegister: Enum flags representing warnings.
         """
-        self.pump_control[3]
+        return self.pump_control_status.warning_register
 
     @property
     def fault_register(self) -> FaultRegister:
@@ -214,7 +598,7 @@ class nXDS:
         Returns:
             FaultRegister: Enum flags representing current fault status.
         """
-        self.pump_control[4]
+        return self.pump_control_status.fault_register
 
     @property
     def control_mode(self) -> ControlMode:
@@ -224,9 +608,7 @@ class nXDS:
         Returns:
             ControlMode: Enum indicating current control mode (none, serial, parallel, manual).
         """
-        ret = self.query("V802")
-        values = ret.split(";")
-        status = int(values[1], 16)
+        status = int(self._read_fields(_Command.PUMP_CONTROL, 5)[1], 16)
         ctrl_mode = 0
         ctrl_mode += (status >> 6) & 1  # bit 6
         ctrl_mode += ((status >> 7) & 1) << 1  # bit 7
@@ -241,8 +623,7 @@ class nXDS:
         Returns:
             int: Normal speed threshold (50–100).
         """
-        ret = self.query("S804")
-        return int(ret)
+        return self._read_int(_Command.NORMAL_SPEED_THRESHOLD)
 
     @normal_speed_threshold.setter
     def normal_speed_threshold(self, threshold: int) -> None:
@@ -253,10 +634,11 @@ class nXDS:
             threshold (int): Percentage value between 50 and 100.
 
         Raises:
-            AssertionError: If the threshold is outside 50–100.
+            ValueError: If the threshold is outside 50–100.
         """
-        assert 50 <= threshold <= 100, "threshold must be between 50 and 100"
-        self.write(f"S804 {threshold}")
+        if not 50 <= threshold <= 100:
+            raise ValueError("threshold must be between 50 and 100")
+        self._write_register(_Command.NORMAL_SPEED_THRESHOLD, threshold)
 
     @property
     def standby_speed(self) -> int:
@@ -266,8 +648,7 @@ class nXDS:
         Returns:
             int: Standby speed (66–100).
         """
-        ret = self.query("S805")
-        return int(ret)
+        return self._read_int(_Command.STANDBY_SPEED)
 
     def set_standby_speed(self, standby_speed: int, memory: str = "volatile") -> None:
         """
@@ -278,16 +659,16 @@ class nXDS:
             memory (str): Either "volatile" or "non-volatile".
 
         Raises:
-            AssertionError: If memory type is invalid or standby_speed out of bounds.
+            ValueError: If memory type is invalid or standby_speed out of bounds.
         """
-        assert memory in ["volatile", "non-volatile"], (
-            "memory must be 'volatile' or 'non-volatile'"
-        )
-        assert 66 <= standby_speed <= 100, "standby_speed must be between 66 and 100"
+        if memory not in ["volatile", "non-volatile"]:
+            raise ValueError("memory must be 'volatile' or 'non-volatile'")
+        if not 66 <= standby_speed <= 100:
+            raise ValueError("standby_speed must be between 66 and 100")
         if memory == "volatile":
-            self.write(f"C805 {standby_speed}")
+            self._write_register(_Command.STANDBY_SPEED_VOLATILE_PREFIX, standby_speed)
         else:
-            self.write(f"S805 {standby_speed}")
+            self._write_register(_Command.STANDBY_SPEED, standby_speed)
 
     @property
     def auto_run(self) -> bool:
@@ -297,8 +678,7 @@ class nXDS:
         Returns:
             bool: True if auto-run is enabled, False otherwise.
         """
-        ret = self.query("S806")
-        return bool(int(ret))
+        return bool(self._read_int(_Command.AUTO_RUN))
 
     @auto_run.setter
     def auto_run(self, enable: bool) -> None:
@@ -308,7 +688,7 @@ class nXDS:
         Args:
             enable (bool): True to enable, False to disable.
         """
-        self.write(f"S806 {int(enable)}")
+        self._write_register(_Command.AUTO_RUN, int(enable))
 
     @property
     def temperature(self) -> Tuple[float, float]:
@@ -318,8 +698,8 @@ class nXDS:
         Returns:
             tuple: (pump_temperature_C, controller_temperature_C)
         """
-        ret = self.query("V808")
-        values = [float(v) for v in ret.split(";")]
+        values = self._read_fields(_Command.TEMPERATURE, 2)
+        values = [float(v) for v in values]
         return (values[0], values[1])
 
     @property
@@ -350,8 +730,8 @@ class nXDS:
         Returns:
             Tuple[float, float, float]: (voltage [V], current [A], power [W])
         """
-        ret = self.query("V809")
-        values = [float(v) * 0.1 for v in ret.split(";")]
+        values = self._read_fields(_Command.LINK_PARAMETERS, 3)
+        values = [float(v) * 0.1 for v in values]
         return (values[0], values[1], values[2])
 
     @property
@@ -392,8 +772,7 @@ class nXDS:
         Returns:
             float: Run time in hours.
         """
-        ret = self.query("V810")
-        return float(ret)
+        return self._read_float(_Command.RUN_HOURS)
 
     @property
     def pump_cycles(self) -> int:
@@ -403,8 +782,7 @@ class nXDS:
         Returns:
             int: Number of cycles.
         """
-        ret = self.query("V811")
-        return int(ret)
+        return self._read_int(_Command.PUMP_CYCLES)
 
     @property
     def drive_runtime(self) -> Tuple[float, float]:
@@ -414,8 +792,7 @@ class nXDS:
         Returns:
             Tuple[float, float]: (total hours run, hours until replacement)
         """
-        ret = self.query("V813")
-        vals = ret.split(";")
+        vals = self._read_fields(_Command.DRIVE_RUNTIME, 2)
         return (float(vals[0]), float(vals[1]))
 
     @property
@@ -426,15 +803,14 @@ class nXDS:
         Returns:
             Tuple[float, float]: (hours since service, hours until due)
         """
-        ret = self.query("V814")
-        vals = ret.split(";")
+        vals = self._read_fields(_Command.TIPSEAL_SERVICE, 2)
         return (float(vals[0]), float(vals[1]))
 
     def reset_tipseal_service_timer(self) -> None:
         """
         Reset the tipseal service timer (`!C814 1`).
         """
-        self.write("C814 1")
+        self.write(_Command.TIPSEAL_SERVICE_RESET)
 
     @property
     def time_since_bearing_service(self) -> Tuple[float, float]:
@@ -444,15 +820,14 @@ class nXDS:
         Returns:
             Tuple[float, float]: (hours since service, hours until due)
         """
-        ret = self.query("V815")
-        vals = ret.split(";")
+        vals = self._read_fields(_Command.BEARING_SERVICE, 2)
         return (float(vals[0]), float(vals[1]))
 
     def reset_bearing_service_timer(self) -> None:
         """
         Reset the bearing service timer (`!C815 1`).
         """
-        self.write("C815 1")
+        self.write(_Command.BEARING_SERVICE_RESET)
 
     def get_fault_history(
         self, fault_history: int
@@ -472,16 +847,11 @@ class nXDS:
         Returns:
             tuple: (pump power on time [h], SystemStatusRegister1, SystemStatusRegister2, WarningRegister, FaultRegister)
         """
-        ret = self.query(f"V81{fault_history + 5}")
-        values = ret.split(";")
-        # time pump-controller has run, then 4 hex words
-        # convert time to float, convert each hex word to the respective IntFlag
-        float_time = float(values[0])
-        ssr1 = SystemStatusRegister1(int(values[1], 16))
-        ssr2 = SystemStatusRegister2(int(values[2], 16))
-        warn = WarningRegister(int(values[3], 16))
-        fault = FaultRegister(int(values[4], 16))
-        return (float_time, ssr1, ssr2, warn, fault)
+        if not 1 <= fault_history <= 4:
+            raise ValueError("fault_history must be between 1 and 4")
+
+        command = f"V81{fault_history + 5}"
+        return self._parse_status_frame(self.query(command), command)
 
     @property
     def fault_history_1(
@@ -563,7 +933,7 @@ class nXDS:
         Returns:
             str: Version string.
         """
-        return self.query("S820")
+        return self.query(_Command.CUSTOMER_INTERFACE_SW)
 
     @property
     def motor_control_boot_loader_version(self) -> str:
@@ -573,7 +943,7 @@ class nXDS:
         Returns:
             str: Version string.
         """
-        return self.query("S822")
+        return self.query(_Command.MOTOR_CONTROL_BOOT)
 
     @property
     def customer_interface_boot_loader_version(self) -> str:
@@ -583,7 +953,7 @@ class nXDS:
         Returns:
             str: Version string.
         """
-        return self.query("S823")
+        return self.query(_Command.CUSTOMER_INTERFACE_BOOT)
 
     @property
     def service_settings(self) -> Service:
@@ -593,7 +963,7 @@ class nXDS:
         Returns:
             Service: Enum value for current service display/FAIL output mode.
         """
-        return Service(int(self.query("S825")))
+        return Service(self._read_int(_Command.SERVICE_SETTINGS))
 
     @property
     def service_register(self) -> ServiceRegister:
@@ -603,7 +973,7 @@ class nXDS:
         Returns:
             ServiceRegister: Bitmask with service-related flags.
         """
-        values = self.query("V826")
+        values = self._read_scalar(_Command.SERVICE_REGISTER)
         status = int(values, 16)
         return ServiceRegister(status)
 
@@ -615,4 +985,4 @@ class nXDS:
         Returns:
             str: string encoding pump identity.
         """
-        return self.query("S835")
+        return self.query(_Command.SERVICE_INFO)
