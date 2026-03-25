@@ -65,6 +65,15 @@ def test_query_frames_and_parses_response() -> None:
     assert transport.writes == [b"?S804\r"]
 
 
+def test_query_accepts_equals_prefixed_response() -> None:
+    dev, transport = _make_device([b"=V810 123.5\r"])
+
+    value = dev.query("V810")
+
+    assert value == "123.5"
+    assert transport.writes == [b"?V810\r"]
+
+
 def test_query_with_explicit_transport() -> None:
     transport = FakeTransport([b"S804 75\r"])
     dev = nXDS(transport)
@@ -230,6 +239,15 @@ def test_split_status_properties_remain_available() -> None:
 
 def test_write_validates_ack_prefix() -> None:
     dev, transport = _make_device([b"C802 1\r"])
+
+    ok = dev.write("C802 1")
+
+    assert ok is True
+    assert transport.writes == [b"!C802 1\r"]
+
+
+def test_write_accepts_star_prefixed_ack() -> None:
+    dev, transport = _make_device([b"*C802 1\r"])
 
     ok = dev.write("C802 1")
 

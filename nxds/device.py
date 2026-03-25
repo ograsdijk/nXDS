@@ -439,15 +439,33 @@ class nXDS:
                     continue
                 raise nXDSTimeoutError(f"Empty response for '{payload}'")
 
-            if expect_prefix is not None and not decoded.startswith(expect_prefix):
+            expected_frame = None
+            if payload.startswith("?"):
+                expected_frame = "="
+            elif payload.startswith("!"):
+                expected_frame = "*"
+
+            normalized = decoded
+            if decoded[:1] in ("=", "*"):
+                frame = decoded[0]
+                if expected_frame is not None and frame != expected_frame:
+                    if attempt < attempts - 1:
+                        time.sleep(0.01)
+                        continue
+                    raise nXDSProtocolError(
+                        f"Response frame '{frame}' != '{expected_frame}'"
+                    )
+                normalized = decoded[1:].lstrip()
+
+            if expect_prefix is not None and not normalized.startswith(expect_prefix):
                 if attempt < attempts - 1:
                     time.sleep(0.01)
                     continue
                 raise nXDSProtocolError(
-                    f"Response prefix '{decoded[: len(expect_prefix)]}' != '{expect_prefix}'"
+                    f"Response prefix '{normalized[: len(expect_prefix)]}' != '{expect_prefix}'"
                 )
 
-            return decoded
+            return normalized
 
         raise nXDSTimeoutError(
             f"No valid response for '{payload}' after {attempts} attempts; last response='{last_response}'"
