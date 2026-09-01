@@ -1,5 +1,4 @@
 import socket
-import time
 from dataclasses import dataclass
 from typing import Literal, Tuple
 
@@ -24,8 +23,24 @@ class nXDSTimeoutError(nXDSError):
     """Raised when a command does not receive a response in time."""
 
 
+class nXDSCommunicationError(nXDSError):
+    """Raised when the transport connection is closed or unusable."""
+
+
 class nXDSProtocolError(nXDSError):
     """Raised when a response violates expected protocol framing/content."""
+
+
+class nXDSResponseMismatchError(nXDSProtocolError):
+    """Raised when a response belongs to a different outstanding request."""
+
+    def __init__(self, expected_prefix: str, received_prefix: str) -> None:
+        self.expected_prefix = expected_prefix
+        self.received_prefix = received_prefix
+        super().__init__(
+            f"Expected response prefix '{expected_prefix}', "
+            f"received '{received_prefix}'"
+        )
 
 
 class nXDSParseError(nXDSError):
@@ -223,16 +238,34 @@ class TcpSocketTransport(BaseTransport):
     def open(self) -> None:
         if self._sock is not None:
             return
-        self._sock = socket.create_connection(
-            (self.host, self.port),
-            timeout=self.timeout_s,
-        )
-        self._sock.settimeout(self.timeout_s)
+        try:
+            sock = socket.create_connection(
+                (self.host, self.port),
+                timeout=self.timeout_s,
+            )
+            sock.settimeout(self.timeout_s)
+        except OSError as exc:
+            raise nXDSCommunicationError(
+                f"Failed opening TCP connection {self.host}:{self.port}: {exc}"
+            ) from exc
+        self._sock = sock
+
+    def _invalidate_socket(self) -> None:
+        """Detach and best-effort close an untrustworthy TCP socket."""
+        sock, self._sock = self._sock, None
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     def close(self) -> None:
-        if self._sock is not None:
-            self._sock.close()
-            self._sock = None
+        self._invalidate_socket()
 
     @property
     def is_open(self) -> bool:
@@ -244,7 +277,13 @@ class TcpSocketTransport(BaseTransport):
         return self._sock
 
     def write(self, data: bytes) -> None:
-        self._require_open().sendall(data)
+        try:
+            self._require_open().sendall(data)
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            self._invalidate_socket()
+            raise nXDSCommunicationError(f"TCP write failed: {exc}") from exc
 
     def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
         sock = self._require_open()
@@ -254,17 +293,47 @@ class TcpSocketTransport(BaseTransport):
         try:
             buf = bytearray()
             while not buf.endswith(terminator):
-                chunk = sock.recv(1)
-                if not chunk:
+                try:
+                    chunk = sock.recv(1)
+                except TimeoutError:
                     break
+                if not chunk:
+                    self._invalidate_socket()
+                    raise nXDSCommunicationError(
+                        "TCP connection closed while reading response."
+                    )
                 buf.extend(chunk)
             return bytes(buf)
+        except OSError as exc:
+            self._invalidate_socket()
+            raise nXDSCommunicationError(f"TCP read failed: {exc}") from exc
         finally:
-            sock.settimeout(old_timeout)
+            if self._sock is sock:
+                sock.settimeout(old_timeout)
 
     def flush_input(self) -> None:
-        # No generic portable TCP input flush.
-        return None
+        sock = self._require_open()
+        old_timeout = sock.gettimeout()
+        try:
+            sock.setblocking(False)
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except (BlockingIOError, TimeoutError):
+                    break
+                if not chunk:
+                    self._invalidate_socket()
+                    raise nXDSCommunicationError(
+                        "TCP connection closed while flushing input."
+                    )
+        except OSError as exc:
+            self._invalidate_socket()
+            raise nXDSCommunicationError(
+                f"TCP input flush failed: {exc}"
+            ) from exc
+        finally:
+            if self._sock is sock:
+                sock.settimeout(old_timeout)
 
     def flush_output(self) -> None:
         # No generic portable TCP output flush.
@@ -420,56 +489,42 @@ class nXDS:
         timeout_s: float | None = None,
         expect_prefix: str | None = None,
     ) -> str:
-        attempts = self._retries + 1
-        last_response = ""
-        for attempt in range(attempts):
-            self.transport.write(payload.encode("ascii") + self._terminator)
-            response = self.transport.read_until(
-                self._terminator,
-                timeout_s=(
-                    self._response_timeout_s if timeout_s is None else timeout_s
-                ),
-            )
-            decoded = response.decode("ascii", errors="replace").strip()
-            last_response = decoded
-
-            if not decoded:
-                if attempt < attempts - 1:
-                    time.sleep(0.01)
-                    continue
-                raise nXDSTimeoutError(f"Empty response for '{payload}'")
-
-            expected_frame = None
-            if payload.startswith("?"):
-                expected_frame = "="
-            elif payload.startswith("!"):
-                expected_frame = "*"
-
-            normalized = decoded
-            if decoded[:1] in ("=", "*"):
-                frame = decoded[0]
-                if expected_frame is not None and frame != expected_frame:
-                    if attempt < attempts - 1:
-                        time.sleep(0.01)
-                        continue
-                    raise nXDSProtocolError(
-                        f"Response frame '{frame}' != '{expected_frame}'"
-                    )
-                normalized = decoded[1:].lstrip()
-
-            if expect_prefix is not None and not normalized.startswith(expect_prefix):
-                if attempt < attempts - 1:
-                    time.sleep(0.01)
-                    continue
-                raise nXDSProtocolError(
-                    f"Response prefix '{normalized[: len(expect_prefix)]}' != '{expect_prefix}'"
-                )
-
-            return normalized
-
-        raise nXDSTimeoutError(
-            f"No valid response for '{payload}' after {attempts} attempts; last response='{last_response}'"
+        # A timeout or mismatched frame makes request/response alignment ambiguous.
+        # Never replay here: downstream policy must establish a fresh connection.
+        self.transport.write(payload.encode("ascii") + self._terminator)
+        response = self.transport.read_until(
+            self._terminator,
+            timeout_s=(self._response_timeout_s if timeout_s is None else timeout_s),
         )
+        decoded = response.decode("ascii", errors="replace").strip()
+
+        if not decoded:
+            raise nXDSTimeoutError(f"Empty response for '{payload}'")
+
+        expected_frame = None
+        if payload.startswith("?"):
+            expected_frame = "="
+        elif payload.startswith("!"):
+            expected_frame = "*"
+
+        normalized = decoded
+        if decoded[:1] in ("=", "*"):
+            frame = decoded[0]
+            if expected_frame is not None and frame != expected_frame:
+                raise nXDSProtocolError(
+                    f"Response frame '{frame}' != '{expected_frame}'"
+                )
+            normalized = decoded[1:].lstrip()
+
+        prefix_matches = expect_prefix is None or (
+            normalized == expect_prefix
+            or normalized.startswith((f"{expect_prefix} ", f"{expect_prefix};"))
+        )
+        if expect_prefix is not None and not prefix_matches:
+            received_prefix = normalized.split(maxsplit=1)[0] if normalized else ""
+            raise nXDSResponseMismatchError(expect_prefix, received_prefix)
+
+        return normalized
 
     def query(self, query: str) -> str:
         """
