@@ -1,4 +1,5 @@
 import socket
+import time
 from dataclasses import dataclass
 from typing import Literal, Tuple
 
@@ -223,6 +224,9 @@ class SerialTransport(BaseTransport):
 class TcpSocketTransport(BaseTransport):
     """TCP socket transport."""
 
+    _FLUSH_MAX_BYTES = 64 * 1024
+    _FLUSH_MAX_DURATION_S = 0.05
+
     def __init__(
         self,
         host: str,
@@ -279,8 +283,6 @@ class TcpSocketTransport(BaseTransport):
     def write(self, data: bytes) -> None:
         try:
             self._require_open().sendall(data)
-        except TimeoutError:
-            raise
         except OSError as exc:
             self._invalidate_socket()
             raise nXDSCommunicationError(f"TCP write failed: {exc}") from exc
@@ -288,11 +290,15 @@ class TcpSocketTransport(BaseTransport):
     def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
         sock = self._require_open()
         old_timeout = sock.gettimeout()
-        if timeout_s is not None:
-            sock.settimeout(timeout_s)
+        effective_timeout = self.timeout_s if timeout_s is None else timeout_s
+        deadline = time.monotonic() + effective_timeout
         try:
             buf = bytearray()
             while not buf.endswith(terminator):
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    break
+                sock.settimeout(remaining_s)
                 try:
                     chunk = sock.recv(1)
                 except TimeoutError:
@@ -314,11 +320,16 @@ class TcpSocketTransport(BaseTransport):
     def flush_input(self) -> None:
         sock = self._require_open()
         old_timeout = sock.gettimeout()
+        deadline = time.monotonic() + self._FLUSH_MAX_DURATION_S
+        drained = 0
         try:
             sock.setblocking(False)
-            while True:
+            while (
+                drained < self._FLUSH_MAX_BYTES
+                and time.monotonic() < deadline
+            ):
                 try:
-                    chunk = sock.recv(4096)
+                    chunk = sock.recv(min(4096, self._FLUSH_MAX_BYTES - drained))
                 except (BlockingIOError, TimeoutError):
                     break
                 if not chunk:
@@ -326,6 +337,7 @@ class TcpSocketTransport(BaseTransport):
                     raise nXDSCommunicationError(
                         "TCP connection closed while flushing input."
                     )
+                drained += len(chunk)
         except OSError as exc:
             self._invalidate_socket()
             raise nXDSCommunicationError(
@@ -496,10 +508,14 @@ class nXDS:
             self._terminator,
             timeout_s=(self._response_timeout_s if timeout_s is None else timeout_s),
         )
-        decoded = response.decode("ascii", errors="replace").strip()
-
-        if not decoded:
+        if not response:
             raise nXDSTimeoutError(f"Empty response for '{payload}'")
+        if not response.endswith(self._terminator):
+            raise nXDSTimeoutError(
+                f"Incomplete response for '{payload}': missing terminator; "
+                f"partial={response!r}"
+            )
+        decoded = response.decode("ascii", errors="replace").strip()
 
         expected_frame = None
         if payload.startswith("?"):

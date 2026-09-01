@@ -200,6 +200,15 @@ def test_exchange_does_not_retry_ambiguous_empty_response() -> None:
     assert transport.writes == [b"?S804\r"]
 
 
+def test_exchange_rejects_incomplete_frame_without_retry() -> None:
+    dev, transport = _make_device([b"=V809", b"=V809 240;10;100\r"], retries=1)
+
+    with pytest.raises(nXDSTimeoutError, match="missing terminator"):
+        dev.query("V809")
+
+    assert transport.writes == [b"?V809\r"]
+
+
 def test_delayed_v809_response_is_rejected_by_v808_query() -> None:
     dev, transport = _make_device([b"", b"=V809 240;10;100\r"])
 

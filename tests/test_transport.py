@@ -2,6 +2,7 @@ import socket
 
 import pytest
 
+import nxds.device as device_module
 from nxds import TcpSocketTransport, nXDSCommunicationError
 
 
@@ -69,6 +70,18 @@ def test_fatal_write_invalidates_without_retry():
     assert not transport.is_open
 
 
+def test_write_timeout_invalidates_without_retry():
+    sock = FakeSocket(send_error=TimeoutError("timed out"))
+    transport = opened_transport(sock)
+
+    with pytest.raises(nXDSCommunicationError):
+        transport.write(b"command")
+
+    assert sock.send_calls == 1
+    assert not transport.is_open
+    assert sock.closed
+
+
 def test_open_after_failure_creates_fresh_socket(monkeypatch):
     failed = FakeSocket([b""])
     fresh = FakeSocket()
@@ -111,3 +124,35 @@ def test_flush_eof_invalidates_socket():
         transport.flush_input()
 
     assert not transport.is_open
+
+
+def test_read_deadline_stops_continuous_unterminated_input(monkeypatch):
+    sock = FakeSocket([b"x"], timeout=0.25)
+    transport = opened_transport(sock)
+    times = iter((0.0, 0.01, 0.06))
+    monkeypatch.setattr(device_module.time, "monotonic", lambda: next(times))
+
+    assert transport.read_until(b"\r", timeout_s=0.05) == b"x"
+    assert transport.is_open
+    assert sock.timeout == 0.25
+
+
+def test_flush_stops_at_byte_limit_under_continuous_input(monkeypatch):
+    class ContinuousSocket(FakeSocket):
+        def __init__(self):
+            super().__init__(timeout=0.25)
+            self.recv_calls = 0
+
+        def recv(self, size):
+            self.recv_calls += 1
+            return b"x" * size
+
+    monkeypatch.setattr(device_module.time, "monotonic", lambda: 0.0)
+    sock = ContinuousSocket()
+    transport = opened_transport(sock)
+
+    transport.flush_input()
+
+    assert sock.recv_calls == TcpSocketTransport._FLUSH_MAX_BYTES // 4096
+    assert sock.timeout == 0.25
+    assert transport.is_open
