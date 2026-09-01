@@ -6,6 +6,7 @@ from nxds.device import (
     nXDS,
     nXDSParseError,
     nXDSProtocolError,
+    nXDSResponseMismatchError,
     nXDSTimeoutError,
 )
 from nxds.registers import (
@@ -190,13 +191,42 @@ def test_query_failure_matrix(
         dev.query("S804")
 
 
-def test_exchange_retries_on_empty_response() -> None:
+def test_exchange_does_not_retry_ambiguous_empty_response() -> None:
     dev, transport = _make_device([b"", b"S804 75\r"], retries=1)
 
-    value = dev.query("S804")
+    with pytest.raises(nXDSTimeoutError):
+        dev.query("S804")
 
-    assert value == "75"
-    assert transport.writes == [b"?S804\r", b"?S804\r"]
+    assert transport.writes == [b"?S804\r"]
+
+
+def test_delayed_v809_response_is_rejected_by_v808_query() -> None:
+    dev, transport = _make_device([b"", b"=V809 240;10;100\r"])
+
+    with pytest.raises(nXDSTimeoutError):
+        dev.query("V809")
+    with pytest.raises(nXDSResponseMismatchError) as exc_info:
+        dev.query("V808")
+
+    assert exc_info.value.expected_prefix == "V808"
+    assert exc_info.value.received_prefix == "V809"
+    assert transport.writes == [b"?V809\r", b"?V808\r"]
+
+
+def test_inverse_response_order_is_detected() -> None:
+    dev, _ = _make_device([b"=V808 30;40\r"])
+
+    with pytest.raises(nXDSResponseMismatchError, match="V809.*V808"):
+        dev.query("V809")
+
+
+def test_state_changing_write_is_never_retried() -> None:
+    dev, transport = _make_device([b""], retries=3)
+
+    with pytest.raises(nXDSTimeoutError):
+        dev.write("C802 1")
+
+    assert transport.writes == [b"!C802 1\r"]
 
 
 @pytest.mark.parametrize(
