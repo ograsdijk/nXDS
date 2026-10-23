@@ -1,5 +1,6 @@
 import socket
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Literal, Tuple
 
@@ -369,12 +370,19 @@ class nXDS:
     ):
         if retries < 0:
             raise ValueError("retries must be >= 0")
+        if retries > 0:
+            warnings.warn(
+                "nXDS no longer retries exchanges, because a re-sent request can "
+                "pair a late reply with the wrong command; 'retries' is ignored. "
+                "Reconnect after a communication error instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         self.transport = transport
 
         self.transport.open()
         self._terminator = b"\r"
-        self._retries = retries
         self._response_timeout_s = response_timeout_s
 
     @classmethod
