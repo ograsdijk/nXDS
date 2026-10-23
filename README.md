@@ -34,7 +34,7 @@ Use as a context manager:
 
 - `nXDS(transport, retries=0, response_timeout_s=None)`
 	- `transport`: any `BaseTransport` implementation
-	- `retries`: extra retry attempts for empty/invalid framed responses
+	- `retries`: deprecated and ignored. Exchanges are never retried, because a re-sent request can pair a late reply with the wrong command. After a communication error, reconnect instead.
 	- `response_timeout_s`: per-exchange timeout override
 
 ### Factory constructors

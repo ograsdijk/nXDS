@@ -54,6 +54,9 @@ def _make_device(
     retries: int = 0,
 ) -> tuple[nXDS, FakeTransport]:
     transport = FakeTransport(responses)
+    if retries > 0:
+        with pytest.warns(DeprecationWarning, match="retries"):
+            return nXDS(transport, retries=retries), transport
     return nXDS(transport, retries=retries), transport
 
 
@@ -112,16 +115,17 @@ def test_from_serial_port_forwards_serial_args(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(device_module, "SerialTransport", _serial_transport_factory)
 
-    _ = nXDS.from_serial_port(
-        "COM7",
-        baudrate=9600,
-        timeout_s=0.5,
-        bytesize=8,
-        parity="N",
-        stopbits=1,
-        retries=2,
-        response_timeout_s=0.75,
-    )
+    with pytest.warns(DeprecationWarning, match="retries"):
+        _ = nXDS.from_serial_port(
+            "COM7",
+            baudrate=9600,
+            timeout_s=0.5,
+            bytesize=8,
+            parity="N",
+            stopbits=1,
+            retries=2,
+            response_timeout_s=0.75,
+        )
 
     assert recorded["args"] == ("COM7",)
     assert recorded["kwargs"] == {
@@ -158,13 +162,14 @@ def test_from_tcp_forwards_tcp_args(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(device_module, "TcpSocketTransport", _tcp_transport_factory)
 
-    _ = nXDS.from_tcp(
-        "192.168.1.55",
-        7777,
-        timeout_s=0.9,
-        retries=3,
-        response_timeout_s=1.2,
-    )
+    with pytest.warns(DeprecationWarning, match="retries"):
+        _ = nXDS.from_tcp(
+            "192.168.1.55",
+            7777,
+            timeout_s=0.9,
+            retries=3,
+            response_timeout_s=1.2,
+        )
 
     assert recorded["args"] == ("192.168.1.55", 7777)
     assert recorded["kwargs"] == {
@@ -315,3 +320,9 @@ def test_set_standby_speed_validation_error() -> None:
 
     with pytest.raises(ValueError):
         dev.set_standby_speed(65)
+
+
+def test_default_retries_does_not_warn(recwarn: pytest.WarningsRecorder) -> None:
+    _make_device([b"S804 75\r"])
+
+    assert not [w for w in recwarn if issubclass(w.category, DeprecationWarning)]
