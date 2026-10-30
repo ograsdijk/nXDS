@@ -16,6 +16,9 @@ from .registers import (
     WarningRegister,
 )
 
+# Used when neither the call, the device nor the transport sets a timeout.
+_DEFAULT_RESPONSE_TIMEOUT_S = 1.0
+
 
 class nXDSError(Exception):
     """Base exception for nXDS communication and protocol errors."""
@@ -509,21 +512,18 @@ class nXDS:
         timeout_s: float | None = None,
         expect_prefix: str | None = None,
     ) -> str:
-        # A timeout or mismatched frame makes request/response alignment ambiguous.
-        # Never replay here: downstream policy must establish a fresh connection.
-        self.transport.write(payload.encode("ascii") + self._terminator)
-        response = self.transport.read_until(
-            self._terminator,
-            timeout_s=(self._response_timeout_s if timeout_s is None else timeout_s),
-        )
-        if not response:
-            raise nXDSTimeoutError(f"Empty response for '{payload}'")
-        if not response.endswith(self._terminator):
-            raise nXDSTimeoutError(
-                f"Incomplete response for '{payload}': missing terminator; "
-                f"partial={response!r}"
-            )
-        decoded = response.decode("ascii", errors="replace").strip()
+        # Never replay a request: a re-sent request can pair a late reply with
+        # the wrong command. Instead, only the reply to this request is
+        # accepted; a late reply to an earlier request (e.g. one still
+        # buffered in a serial-to-TCP gateway) is discarded and reading
+        # continues until the matching reply or the deadline.
+        if timeout_s is None:
+            timeout_s = self._response_timeout_s
+        if timeout_s is None:
+            timeout_s = getattr(self.transport, "timeout_s", None)
+        if timeout_s is None:
+            timeout_s = _DEFAULT_RESPONSE_TIMEOUT_S
+        deadline = time.monotonic() + timeout_s
 
         expected_frame = None
         if payload.startswith("?"):
@@ -531,24 +531,50 @@ class nXDS:
         elif payload.startswith("!"):
             expected_frame = "*"
 
-        normalized = decoded
-        if decoded[:1] in ("=", "*"):
-            frame = decoded[0]
-            if expected_frame is not None and frame != expected_frame:
-                raise nXDSProtocolError(
-                    f"Response frame '{frame}' != '{expected_frame}'"
+        self.transport.flush_input()
+        self.transport.write(payload.encode("ascii") + self._terminator)
+
+        mismatch: nXDSProtocolError | None = None
+        while True:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                if mismatch is not None:
+                    raise mismatch
+                raise nXDSTimeoutError(f"Empty response for '{payload}'")
+            response = self.transport.read_until(
+                self._terminator, timeout_s=remaining_s
+            )
+            if not response:
+                if mismatch is not None:
+                    continue
+                raise nXDSTimeoutError(f"Empty response for '{payload}'")
+            if not response.endswith(self._terminator):
+                raise nXDSTimeoutError(
+                    f"Incomplete response for '{payload}': missing terminator; "
+                    f"partial={response!r}"
                 )
-            normalized = decoded[1:].lstrip()
+            decoded = response.decode("ascii", errors="replace").strip()
 
-        prefix_matches = expect_prefix is None or (
-            normalized == expect_prefix
-            or normalized.startswith((f"{expect_prefix} ", f"{expect_prefix};"))
-        )
-        if expect_prefix is not None and not prefix_matches:
-            received_prefix = normalized.split(maxsplit=1)[0] if normalized else ""
-            raise nXDSResponseMismatchError(expect_prefix, received_prefix)
+            normalized = decoded
+            if decoded[:1] in ("=", "*"):
+                frame = decoded[0]
+                if expected_frame is not None and frame != expected_frame:
+                    mismatch = nXDSProtocolError(
+                        f"Response frame '{frame}' != '{expected_frame}'"
+                    )
+                    continue
+                normalized = decoded[1:].lstrip()
 
-        return normalized
+            prefix_matches = expect_prefix is None or (
+                normalized == expect_prefix
+                or normalized.startswith((f"{expect_prefix} ", f"{expect_prefix};"))
+            )
+            if expect_prefix is not None and not prefix_matches:
+                received_prefix = normalized.split(maxsplit=1)[0] if normalized else ""
+                mismatch = nXDSResponseMismatchError(expect_prefix, received_prefix)
+                continue
+
+            return normalized
 
     def query(self, query: str) -> str:
         """
@@ -573,7 +599,9 @@ class nXDS:
         Returns:
             bool: True if the command was accepted without error.
         """
-        self._exchange(f"!{command}", expect_prefix=command)
+        # Match the acknowledgement on the command id (e.g. "C802") only: the
+        # rest of the ack is the device's reply, not an echo of the value.
+        self._exchange(f"!{command}", expect_prefix=command.split(maxsplit=1)[0])
         return True
 
     def start_pump(self) -> None:

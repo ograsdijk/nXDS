@@ -21,7 +21,9 @@ class FakeTransport(BaseTransport):
     def __init__(self, responses: list[bytes]) -> None:
         self._responses = responses
         self.writes: list[bytes] = []
+        self.events: list[str] = []
         self._is_open = False
+        self.timeout_s = 0.05
 
     def open(self) -> None:
         self._is_open = True
@@ -35,6 +37,7 @@ class FakeTransport(BaseTransport):
 
     def write(self, data: bytes) -> None:
         self.writes.append(data)
+        self.events.append("write")
 
     def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
         if not self._responses:
@@ -42,7 +45,7 @@ class FakeTransport(BaseTransport):
         return self._responses.pop(0)
 
     def flush_input(self) -> None:
-        pass
+        self.events.append("flush_input")
 
     def flush_output(self) -> None:
         pass
@@ -225,6 +228,34 @@ def test_delayed_v809_response_is_rejected_by_v808_query() -> None:
     assert exc_info.value.expected_prefix == "V808"
     assert exc_info.value.received_prefix == "V809"
     assert transport.writes == [b"?V809\r", b"?V808\r"]
+
+
+def test_late_reply_is_skipped_until_the_matching_one() -> None:
+    dev, transport = _make_device([b"=V809 240;10;100\r", b"=V808 30;40\r"])
+
+    assert dev.query("V808") == "30;40"
+    assert transport.writes == [b"?V808\r"]
+
+
+def test_late_write_ack_is_skipped_by_a_query() -> None:
+    dev, _ = _make_device([b"*C802 0\r", b"=V808 30;40\r"])
+
+    assert dev.query("V808") == "30;40"
+
+
+def test_write_waits_for_its_own_ack() -> None:
+    dev, transport = _make_device([b"=V808 30;40\r", b"*C802 0\r"])
+
+    assert dev.write("C802 1") is True
+    assert transport._responses == []
+
+
+def test_exchange_flushes_input_before_writing() -> None:
+    dev, transport = _make_device([b"=V808 30;40\r"])
+
+    dev.query("V808")
+
+    assert transport.events == ["flush_input", "write"]
 
 
 def test_inverse_response_order_is_detected() -> None:

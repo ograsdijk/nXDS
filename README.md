@@ -34,8 +34,10 @@ Use as a context manager:
 
 - `nXDS(transport, retries=0, response_timeout_s=None)`
 	- `transport`: any `BaseTransport` implementation
-	- `retries`: deprecated and ignored. Exchanges are never retried, because a re-sent request can pair a late reply with the wrong command. After a communication error, reconnect instead.
-	- `response_timeout_s`: per-exchange timeout override
+	- `retries`: deprecated and ignored. Exchanges are never retried, because a re-sent request can pair a late reply with the wrong command.
+	- `response_timeout_s`: per-exchange timeout override (default: the transport's `timeout_s`); it bounds the whole exchange
+
+Each exchange flushes pending input, sends the request and accepts only the reply to it: a query reply (`=`) that starts with the queried command, or a write acknowledgement (`*`) for the written command id. Anything else, such as a late reply to an earlier request still buffered in a serial-to-TCP gateway, is discarded and reading continues until the matching reply or the timeout. If only unrelated replies arrived, the last mismatch is raised (`nXDSResponseMismatchError` or `nXDSProtocolError`); if nothing arrived, `nXDSTimeoutError`.
 
 ### Factory constructors
 
